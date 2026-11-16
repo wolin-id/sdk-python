@@ -1,4 +1,4 @@
-"""Official async Python SDK for the Wolin Solid Pod Engine (`wolin-id`)."""
+"""Official async Python SDK for the Wolin (月印千江) Solid Pod Engine (`wolin-id`)."""
 
 from wolin_id.client import WolinClient
 from wolin_id.dpop import (
@@ -11,6 +11,8 @@ from wolin_id.dpop import (
     verify_dpop_es256,
 )
 from wolin_id.models import (
+    DEFAULT_AUTH_URL,
+    DEFAULT_POD_URL,
     FOAF_NAME_IRI,
     LDP_BASIC_CONTAINER_IRI,
     LDP_CONTAINER_IRI,
@@ -19,13 +21,17 @@ from wolin_id.models import (
     LDP_NON_RDF_SOURCE_IRI,
     LDP_RDF_SOURCE_IRI,
     LDP_RESOURCE_IRI,
+    MAX_POD_ID_LEN,
+    MIN_POD_ID_LEN,
     PIM_STORAGE_CLASS_IRI,
     PIM_STORAGE_IRI,
     RDF_TYPE_IRI,
+    RESERVED_POD_IDS,
     SOLID_OIDC_ISSUER_IRI,
     VCARD_FN_IRI,
     DpopProofClaims,
     DpopValidationError,
+    InvalidPodIdError,
     LdpResource,
     ProvisionPodResult,
     PublicJwk,
@@ -37,6 +43,8 @@ from wolin_id.models import (
     WolinNotFoundError,
     WolinPreconditionError,
     WriteResult,
+    is_valid_pod_id,
+    validate_pod_id,
 )
 from wolin_id.webid import (
     RdfBlankNode,
@@ -51,10 +59,13 @@ __version__ = "0.1.0"
 
 __all__ = [
     "__version__",
+    "DEFAULT_AUTH_URL",
+    "DEFAULT_POD_URL",
     "DpopProofClaims",
     "DpopSigner",
     "DpopValidationError",
     "FOAF_NAME_IRI",
+    "InvalidPodIdError",
     "LDP_BASIC_CONTAINER_IRI",
     "LDP_CONTAINER_IRI",
     "LDP_CONTAINS_IRI",
@@ -63,11 +74,14 @@ __all__ = [
     "LDP_RDF_SOURCE_IRI",
     "LDP_RESOURCE_IRI",
     "LdpResource",
+    "MAX_POD_ID_LEN",
+    "MIN_POD_ID_LEN",
     "PIM_STORAGE_CLASS_IRI",
     "PIM_STORAGE_IRI",
     "ProvisionPodResult",
     "PublicJwk",
     "RDF_TYPE_IRI",
+    "RESERVED_POD_IDS",
     "RdfBlankNode",
     "RdfIri",
     "RdfLiteral",
@@ -86,9 +100,11 @@ __all__ = [
     "b64url_encode",
     "compute_access_token_hash",
     "compute_jwk_thumbprint",
+    "is_valid_pod_id",
     "normalize_htu",
     "parse_turtle_triples",
     "parse_webid_turtle",
     "resolve_iri",
+    "validate_pod_id",
     "verify_dpop_es256",
 ]

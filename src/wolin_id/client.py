@@ -1,7 +1,8 @@
-"""Async HTTP client for Wolin Solid Pods (Solid-OIDC + RFC 9449 DPoP + LDP CRUD)."""
+"""Async HTTP client for Wolin (月印千江) Solid Pods (Solid-OIDC + RFC 9449 DPoP + LDP CRUD)."""
 
 from __future__ import annotations
 
+import json
 import re
 from types import TracebackType
 from typing import Any, Literal
@@ -11,6 +12,8 @@ import httpx
 
 from wolin_id.dpop import DpopSigner
 from wolin_id.models import (
+    DEFAULT_AUTH_URL,
+    DEFAULT_POD_URL,
     LdpResource,
     ProvisionPodResult,
     WebIdProfile,
@@ -19,11 +22,14 @@ from wolin_id.models import (
     WolinNotFoundError,
     WolinPreconditionError,
     WriteResult,
+    validate_pod_id,
 )
 from wolin_id.webid import parse_webid_turtle
 
-_LINK_PART_RE = re.compile(r'<([^>]+)>\s*;\s*(.*)')
+_LINK_PART_RE = re.compile(r"<([^>]+)>\s*;\s*(.*)")
 _REL_PARAM_RE = re.compile(r'rel\s*=\s*(?:"([^"]+)"|([^\s;]+))', re.IGNORECASE)
+_REDIRECT_STATUS_CODES = frozenset({301, 302, 303, 307, 308})
+_MAX_SAFE_REDIRECTS = 5
 
 
 def _parse_link_headers(raw_links: list[str]) -> tuple[tuple[str, ...], str | None]:
@@ -69,11 +75,39 @@ def _split_link_values(header_val: str) -> list[str]:
 
 def _origin_key(url: str) -> str:
     parts = urlsplit(url)
-    return f"{parts.scheme.lower()}://{parts.netloc.lower()}"
+    scheme = parts.scheme.lower()
+    host = (parts.hostname or "").lower()
+    port = parts.port
+    default_port = 80 if scheme == "http" else (443 if scheme == "https" else None)
+    host_fmt = f"[{host}]" if ":" in host else host
+    if port is not None and port != default_port:
+        return f"{scheme}://{host_fmt}:{port}"
+    return f"{scheme}://{host_fmt}"
+
+
+def _validate_redirect_url(url: str) -> str:
+    parts = urlsplit(url)
+    scheme = parts.scheme.lower()
+    if scheme not in ("http", "https") or not parts.hostname:
+        raise WolinHttpError(
+            f"Unsupported or malformed redirect target URL '{url}'",
+            status_code=302,
+            url=url,
+        )
+    if parts.username is not None or parts.password is not None:
+        raise WolinHttpError(
+            "Redirect target URL must not include userinfo credentials",
+            status_code=302,
+            url=url,
+        )
+    return url
 
 
 class WolinClient:
-    """Async Solid LDP & Wolin Pod Cloud client with native RFC 9449 DPoP authentication."""
+    """Async Solid LDP & Wolin (月印千江) Pod Cloud client with native RFC 9449 DPoP."""
+
+    DEFAULT_AUTH_URL: str = DEFAULT_AUTH_URL
+    DEFAULT_POD_URL: str = DEFAULT_POD_URL
 
     def __init__(
         self,
@@ -160,6 +194,7 @@ class WolinClient:
             target_url,
             headers=req_headers,
             content=content,
+            follow_redirects=False,
         )
 
         origin = _origin_key(target_url)
@@ -184,12 +219,66 @@ class WolinClient:
                 target_url,
                 headers=retry_headers,
                 content=content,
+                follow_redirects=False,
             )
             latest_nonce = resp.headers.get("dpop-nonce")
             if latest_nonce:
                 self._dpop_nonces[origin] = latest_nonce
 
         return resp
+
+    async def _send_safe_read(
+        self,
+        method: Literal["GET", "HEAD"],
+        target_url: str,
+        *,
+        headers: dict[str, str] | None = None,
+        include_auth: bool = True,
+        follow_redirects: bool = True,
+    ) -> tuple[httpx.Response, httpx.Headers | None]:
+        """Execute a `GET` or `HEAD` request with safe `302` signed-asset redirect handling.
+
+        When Wolin Engine offloads large `NonRDFSource` blobs via `302 Found` to a short-lived
+        HMAC-signed Edge/R2/CDN URL, cross-origin redirects are followed **without**
+        `Authorization` or `DPoP` headers so credentials are never leaked to external hosts.
+        """
+        resp = await self._send(method, target_url, headers=headers, include_auth=include_auth)
+        if not follow_redirects or resp.status_code not in _REDIRECT_STATUS_CODES:
+            return resp, None
+
+        pod_redirect_headers = resp.headers
+        initial_origin = _origin_key(target_url)
+        current_url = target_url
+
+        for _ in range(_MAX_SAFE_REDIRECTS):
+            location = resp.headers.get("location")
+            if not location:
+                return resp, pod_redirect_headers
+
+            next_url = _validate_redirect_url(urljoin(current_url, location.strip()))
+            same_origin = _origin_key(next_url) == initial_origin
+
+            redirect_headers: dict[str, str] = {}
+            if headers and "Accept" in headers:
+                redirect_headers["Accept"] = headers["Accept"]
+
+            resp = await self._send(
+                method,
+                next_url,
+                headers=redirect_headers,
+                include_auth=(include_auth and same_origin),
+            )
+            current_url = next_url
+            if resp.status_code not in _REDIRECT_STATUS_CODES:
+                return resp, pod_redirect_headers
+
+        raise WolinHttpError(
+            f"Exceeded maximum redirect hops ({_MAX_SAFE_REDIRECTS}) while reading {target_url}",
+            status_code=resp.status_code,
+            url=target_url,
+            headers=dict(resp.headers),
+            body=resp.content,
+        )
 
     def _raise_for_ldp_error(self, resp: httpx.Response, target_url: str) -> None:
         status = resp.status_code
@@ -230,19 +319,33 @@ class WolinClient:
             body=resp.content,
         )
 
-    def _to_ldp_resource(self, resp: httpx.Response, target_url: str) -> LdpResource:
+    def _to_ldp_resource(
+        self,
+        resp: httpx.Response,
+        target_url: str,
+        *,
+        fallback_headers: httpx.Headers | None = None,
+    ) -> LdpResource:
         raw_links = resp.headers.get_list("link")
-        link_types, acl_rel = _parse_link_headers(raw_links)
+        if not raw_links and fallback_headers is not None:
+            raw_links = fallback_headers.get_list("link")
+        link_types, acl_rel = _parse_link_values_from_headers(raw_links)
         acl_url = urljoin(target_url, acl_rel) if acl_rel else None
         content_type = resp.headers.get("content-type", "application/octet-stream")
         media_type = content_type.split(";", 1)[0].strip()
+        etag = resp.headers.get("etag") or (
+            fallback_headers.get("etag") if fallback_headers is not None else None
+        )
+        wac_allow = resp.headers.get("wac-allow") or (
+            fallback_headers.get("wac-allow") if fallback_headers is not None else None
+        )
         return LdpResource(
             url=target_url,
             status_code=resp.status_code,
             content=resp.content,
             content_type=media_type,
-            etag=resp.headers.get("etag"),
-            wac_allow=resp.headers.get("wac-allow"),
+            etag=etag,
+            wac_allow=wac_allow,
             acl_url=acl_url,
             link_types=link_types,
             headers=dict(resp.headers),
@@ -262,7 +365,7 @@ class WolinClient:
         if not doc_url.startswith(("http://", "https://")):
             raise ValueError(f"WebID must be an HTTP(S) URI, got '{trimmed_webid}'")
 
-        resp = await self._send(
+        resp, _ = await self._send_safe_read(
             "GET",
             doc_url,
             headers={"Accept": "text/turtle, application/n-triples;q=0.9"},
@@ -285,9 +388,9 @@ class WolinClient:
     async def head(self, url_or_path: str) -> LdpResource:
         """Issue an LDP `HEAD` request to inspect `ETag`, `Link` types, and `WAC-Allow`."""
         target_url = self.resolve_url(url_or_path)
-        resp = await self._send("HEAD", target_url)
+        resp, fallback_hdrs = await self._send_safe_read("HEAD", target_url)
         self._raise_for_ldp_error(resp, target_url)
-        return self._to_ldp_resource(resp, target_url)
+        return self._to_ldp_resource(resp, target_url, fallback_headers=fallback_hdrs)
 
     async def get(
         self,
@@ -296,8 +399,9 @@ class WolinClient:
         accept: str | None = None,
         if_none_match: str | None = None,
         if_match: str | None = None,
+        follow_redirects: bool = True,
     ) -> LdpResource:
-        """Fetch a Solid LDP resource or container with conditional `ETag` support."""
+        """Fetch a Solid LDP resource or container with conditional `ETag` & safe `302` offload."""
         target_url = self.resolve_url(url_or_path)
         headers: dict[str, str] = {}
         if accept:
@@ -307,11 +411,16 @@ class WolinClient:
         if if_match:
             headers["If-Match"] = if_match
 
-        resp = await self._send("GET", target_url, headers=headers)
+        resp, fallback_hdrs = await self._send_safe_read(
+            "GET",
+            target_url,
+            headers=headers,
+            follow_redirects=follow_redirects,
+        )
         if resp.status_code == 304:
-            return self._to_ldp_resource(resp, target_url)
+            return self._to_ldp_resource(resp, target_url, fallback_headers=fallback_hdrs)
         self._raise_for_ldp_error(resp, target_url)
-        return self._to_ldp_resource(resp, target_url)
+        return self._to_ldp_resource(resp, target_url, fallback_headers=fallback_hdrs)
 
     async def put(
         self,
@@ -399,11 +508,10 @@ class WolinClient:
         display_name: str | None = None,
         oidc_issuer: str | None = None,
     ) -> ProvisionPodResult:
-        """Provision a zero-config Wolin Sovereign Pod (`POST /pods`)."""
-        import json
-
-        target_url = self.resolve_url("/pods")
-        body_obj: dict[str, Any] = {"pod_id": pod_id}
+        """Provision a zero-config Wolin Sovereign Pod (`POST /api/pods`)."""
+        validated_pod_id = validate_pod_id(pod_id)
+        target_url = self.resolve_url("/api/pods")
+        body_obj: dict[str, Any] = {"pod_id": validated_pod_id}
         if owner_webid is not None:
             body_obj["owner_webid"] = owner_webid
         if display_name is not None:
@@ -430,3 +538,9 @@ class WolinClient:
             inbox=str(data["inbox"]),
             seeded_resources=tuple(str(item) for item in data.get("seeded_resources", ())),
         )
+
+
+def _parse_link_values_from_headers(
+    raw_links: list[str],
+) -> tuple[tuple[str, ...], str | None]:
+    return _parse_link_headers(raw_links)

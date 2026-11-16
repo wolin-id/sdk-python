@@ -1,9 +1,192 @@
-"""Typed domain models, RDF constants, and exceptions for the Wolin Python SDK."""
+"""Typed domain models, production constants, pod_id validation, and exceptions for Wolin."""
 
 from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass, field
+
+# Official Wolin (月印千江) Production Endpoints
+DEFAULT_AUTH_URL = "https://auth.wolin.id"
+DEFAULT_POD_URL = "https://pod.wolin.id"
+
+# Wolin pod_id Format Constraints
+MIN_POD_ID_LEN = 3
+MAX_POD_ID_LEN = 32
+
+RESERVED_POD_IDS: frozenset[str] = frozenset(
+    {
+        "abuse",
+        "admin",
+        "administrator",
+        "ads",
+        "api",
+        "app",
+        "apps",
+        "assets",
+        "auth",
+        "authorize",
+        "autoconfig",
+        "autodiscover",
+        "backup",
+        "beta",
+        "billing",
+        "blog",
+        "calendar",
+        "cdn",
+        "chat",
+        "cloud",
+        "consent",
+        "console",
+        "contact",
+        "control",
+        "corp",
+        "dashboard",
+        "data",
+        "dev",
+        "dns",
+        "doc",
+        "docs",
+        "download",
+        "downloads",
+        "edge",
+        "email",
+        "engine",
+        "enterprise",
+        "entropy",
+        "events",
+        "files",
+        "forum",
+        "ftp",
+        "gateway",
+        "git",
+        "graphql",
+        "health",
+        "healthz",
+        "help",
+        "home",
+        "host",
+        "hostmaster",
+        "id",
+        "idp",
+        "images",
+        "imap",
+        "img",
+        "inbox",
+        "info",
+        "internal",
+        "jwks",
+        "legal",
+        "local",
+        "localhost",
+        "login",
+        "logout",
+        "logs",
+        "mail",
+        "mailer",
+        "manage",
+        "mcp",
+        "media",
+        "metrics",
+        "mta-sts",
+        "mx",
+        "net",
+        "news",
+        "no-reply",
+        "noreply",
+        "notify",
+        "ns",
+        "ns1",
+        "ns2",
+        "ns3",
+        "ns4",
+        "oauth",
+        "official",
+        "oidc",
+        "ops",
+        "org",
+        "origin",
+        "passport",
+        "pay",
+        "payment",
+        "payments",
+        "pod",
+        "pods",
+        "pop",
+        "pop3",
+        "portal",
+        "postmaster",
+        "press",
+        "pricing",
+        "private",
+        "prod",
+        "production",
+        "profile",
+        "proxy",
+        "pub",
+        "public",
+        "register",
+        "registry",
+        "relay",
+        "root",
+        "rpc",
+        "rss",
+        "sandbox",
+        "search",
+        "secure",
+        "security",
+        "server",
+        "service",
+        "services",
+        "session",
+        "settings",
+        "sftp",
+        "signin",
+        "signout",
+        "signup",
+        "smtp",
+        "solid",
+        "sparql",
+        "ssh",
+        "sso",
+        "stage",
+        "staging",
+        "static",
+        "stats",
+        "status",
+        "storage",
+        "store",
+        "support",
+        "sync",
+        "sys",
+        "system",
+        "team",
+        "telemetry",
+        "terms",
+        "test",
+        "testing",
+        "token",
+        "trust",
+        "updates",
+        "upload",
+        "uploads",
+        "userinfo",
+        "vault",
+        "verify",
+        "vpn",
+        "wac",
+        "web",
+        "webhook",
+        "webhooks",
+        "webid",
+        "webmail",
+        "webmaster",
+        "well-known",
+        "wolin",
+        "ws",
+        "wss",
+        "www",
+    }
+)
 
 # W3C Solid / RDF Vocabulary IRIs
 RDF_TYPE_IRI = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type"
@@ -23,6 +206,10 @@ VCARD_FN_IRI = "http://www.w3.org/2006/vcard/ns#fn"
 
 class WolinError(Exception):
     """Base exception for all Wolin SDK errors."""
+
+
+class InvalidPodIdError(WolinError, ValueError):
+    """Raised when a `pod_id` handle violates Wolin syntax or reserved-word rules."""
 
 
 class TurtleParseError(WolinError):
@@ -62,6 +249,50 @@ class WolinNotFoundError(WolinHttpError):
 
 class WolinPreconditionError(WolinHttpError):
     """Raised on ETag optimistic concurrency precondition failure (412) or state conflict (409)."""
+
+
+def _is_ascii_lower_or_digit(ch: str) -> bool:
+    return ("a" <= ch <= "z") or ("0" <= ch <= "9")
+
+
+def validate_pod_id(pod_id: str) -> str:
+    """Validate a Wolin `pod_id` handle (`3..32` chars, lowercase `[a-z0-9-]`, no `'--'`).
+
+    Enforces:
+    - Length between 3 and 32 characters inclusive
+    - Lowercase ASCII letters, digits, and interior hyphens (`[a-z0-9-]`)
+    - Must start and end with `[a-z0-9]` (no leading or trailing `'-'`)
+    - Must not contain consecutive hyphens (`'--'`)
+    - Must not match a reserved Wolin system/infrastructure handle
+    """
+    if not isinstance(pod_id, str):
+        raise InvalidPodIdError("pod_id must be a string")
+    if len(pod_id) < MIN_POD_ID_LEN or len(pod_id) > MAX_POD_ID_LEN:
+        raise InvalidPodIdError(
+            f"pod_id must be between {MIN_POD_ID_LEN} and {MAX_POD_ID_LEN} lowercase characters"
+        )
+    if (
+        pod_id.startswith("-")
+        or pod_id.endswith("-")
+        or not all(_is_ascii_lower_or_digit(ch) or ch == "-" for ch in pod_id)
+    ):
+        raise InvalidPodIdError(
+            "pod_id must contain only lowercase ASCII [a-z0-9-] and start and end with [a-z0-9]"
+        )
+    if "--" in pod_id:
+        raise InvalidPodIdError("pod_id must not contain consecutive hyphens ('--')")
+    if pod_id in RESERVED_POD_IDS:
+        raise InvalidPodIdError(f"pod_id '{pod_id}' is reserved for system infrastructure")
+    return pod_id
+
+
+def is_valid_pod_id(pod_id: str) -> bool:
+    """Return `True` if `pod_id` satisfies all Wolin `pod_id` format and reservation rules."""
+    try:
+        validate_pod_id(pod_id)
+        return True
+    except InvalidPodIdError:
+        return False
 
 
 @dataclass(frozen=True, slots=True)
@@ -170,7 +401,7 @@ class WriteResult:
 
 @dataclass(frozen=True, slots=True)
 class ProvisionPodResult:
-    """Response returned by Wolin Pod Cloud zero-config provisioning (`POST /pods`)."""
+    """Response returned by Wolin Pod Cloud zero-config provisioning (`POST /api/pods`)."""
 
     pod_id: str
     pod_url: str
