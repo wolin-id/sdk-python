@@ -11,10 +11,14 @@ import httpx
 from cryptography.hazmat.primitives.asymmetric import ec
 
 from wolin_id import (
+    DEFAULT_AUTH_URL,
+    DEFAULT_POD_URL,
+    LDP_NON_RDF_SOURCE_IRI,
     LDP_RDF_SOURCE_IRI,
     LDP_RESOURCE_IRI,
     DpopSigner,
     DpopValidationError,
+    InvalidPodIdError,
     TurtleParseError,
     WolinAuthError,
     WolinClient,
@@ -24,9 +28,11 @@ from wolin_id import (
     b64url_encode,
     compute_access_token_hash,
     compute_jwk_thumbprint,
+    is_valid_pod_id,
     normalize_htu,
     parse_turtle_triples,
     parse_webid_turtle,
+    validate_pod_id,
     verify_dpop_es256,
 )
 
@@ -34,6 +40,42 @@ from wolin_id import (
 def _etag_for(payload: bytes) -> str:
     digest = hashlib.sha256(payload).hexdigest()[:32]
     return f'"{digest}"'
+
+
+class TestPodIdValidation(unittest.TestCase):
+    """Tests for Wolin `pod_id` (`3..32` chars, `[a-z0-9-]`, no `'--'`, non-reserved) rules."""
+
+    def test_valid_and_invalid_pod_ids(self) -> None:
+        self.assertEqual(DEFAULT_AUTH_URL, "https://auth.wolin.id")
+        self.assertEqual(DEFAULT_POD_URL, "https://pod.wolin.id")
+
+        for valid in ("bob", "alice", "alice-01", "a" * 32, "team-alpha-2026"):
+            self.assertTrue(is_valid_pod_id(valid), valid)
+            self.assertEqual(validate_pod_id(valid), valid)
+
+        for invalid in (
+            "",
+            "a",
+            "ab",
+            "a" * 33,
+            "Alice",
+            "-alice",
+            "alice-",
+            "alice--dev",
+            "xn--p1ai",
+            "alice_01",
+            "alice.dev",
+            "auth",
+            "pod",
+            "pods",
+            "api",
+            "admin",
+            "wolin",
+            "www",
+        ):
+            self.assertFalse(is_valid_pod_id(invalid), invalid)
+            with self.assertRaises(InvalidPodIdError):
+                validate_pod_id(invalid)
 
 
 class TestDpopCrypto(unittest.TestCase):
@@ -77,7 +119,7 @@ class TestDpopCrypto(unittest.TestCase):
         token = "mock-solid-oidc-token"
         proof = signer.sign_proof(
             "get",
-            "HTTPS://Alice.Wolin.Cloud:443/private/notes.ttl?draft=1#top",
+            "HTTPS://Alice.Wolin.Id:443/private/notes.ttl?draft=1#top",
             access_token=token,
             nonce="srv-nonce-42",
             iat=1_760_000_000,
@@ -91,13 +133,13 @@ class TestDpopCrypto(unittest.TestCase):
         claims = verify_dpop_es256(
             proof,
             expected_htm="GET",
-            expected_htu="https://alice.wolin.cloud/private/notes.ttl",
+            expected_htu="https://alice.wolin.id/private/notes.ttl",
             access_token=token,
             now=1_760_000_010,
         )
         self.assertEqual(claims.jti, "proof-1")
         self.assertEqual(claims.htm, "GET")
-        self.assertEqual(claims.htu, "https://alice.wolin.cloud/private/notes.ttl")
+        self.assertEqual(claims.htu, "https://alice.wolin.id/private/notes.ttl")
         self.assertEqual(claims.jkt, signer.jwk_thumbprint)
         self.assertEqual(claims.ath, compute_access_token_hash(token))
         self.assertEqual(claims.nonce, "srv-nonce-42")
@@ -107,7 +149,7 @@ class TestDpopCrypto(unittest.TestCase):
             verify_dpop_es256(
                 proof,
                 expected_htm="PUT",
-                expected_htu="https://alice.wolin.cloud/private/notes.ttl",
+                expected_htu="https://alice.wolin.id/private/notes.ttl",
                 access_token=token,
                 now=1_760_000_010,
             )
@@ -116,7 +158,7 @@ class TestDpopCrypto(unittest.TestCase):
             verify_dpop_es256(
                 proof,
                 expected_htm="GET",
-                expected_htu="https://alice.wolin.cloud/private/other.ttl",
+                expected_htu="https://alice.wolin.id/private/other.ttl",
                 access_token=token,
                 now=1_760_000_010,
             )
@@ -125,7 +167,7 @@ class TestDpopCrypto(unittest.TestCase):
             verify_dpop_es256(
                 proof,
                 expected_htm="GET",
-                expected_htu="https://alice.wolin.cloud/private/notes.ttl",
+                expected_htu="https://alice.wolin.id/private/notes.ttl",
                 access_token="wrong-token",
                 now=1_760_000_010,
             )
@@ -134,7 +176,7 @@ class TestDpopCrypto(unittest.TestCase):
             verify_dpop_es256(
                 proof,
                 expected_htm="GET",
-                expected_htu="https://alice.wolin.cloud/private/notes.ttl",
+                expected_htu="https://alice.wolin.id/private/notes.ttl",
                 access_token=token,
                 now=1_760_001_000,
                 max_skew_secs=60,
@@ -146,13 +188,13 @@ class TestDpopCrypto(unittest.TestCase):
             "http://example.com/pods/alice/",
         )
         self.assertEqual(
-            normalize_htu("https://pod.wolin.cloud:8443/pods/alice"),
-            "https://pod.wolin.cloud:8443/pods/alice",
+            normalize_htu("https://pod.wolin.id:8443/pods/alice"),
+            "https://pod.wolin.id:8443/pods/alice",
         )
         with self.assertRaises(DpopValidationError):
-            normalize_htu("https://pod.wolin.cloud/a?b=1", allow_query_or_fragment_input=False)
+            normalize_htu("https://pod.wolin.id/a?b=1", allow_query_or_fragment_input=False)
         with self.assertRaises(DpopValidationError):
-            normalize_htu("ftp://pod.wolin.cloud/a")
+            normalize_htu("ftp://pod.wolin.id/a")
 
 
 class TestWebIdTurtleParser(unittest.TestCase):
@@ -173,37 +215,37 @@ class TestWebIdTurtleParser(unittest.TestCase):
         <#me>
             a foaf:Person, vcard:Individual ;
             foaf:name "Alice Kim"@en ;
-            pim:storage </pods/alice/>, <https://alice.wolin.cloud/> ;
+            pim:storage </pods/alice/>, <https://alice.wolin.id/> ;
             ldp:inbox </pods/alice/inbox/> ;
-            solid:oidcIssuer <https://id.wolin.id> ;
+            solid:oidcIssuer <https://auth.wolin.id> ;
             vcard:hasAddress [
                 a vcard:Home ;
                 vcard:country-name "Korea"
             ] .
         """
-        webid = "https://pod.wolin.cloud/pods/alice/profile/card#me"
+        webid = "https://pod.wolin.id/pods/alice/profile/card#me"
         profile = parse_webid_turtle(
             turtle,
             webid,
-            base_iri="https://pod.wolin.cloud/pods/alice/profile/card",
+            base_iri="https://pod.wolin.id/pods/alice/profile/card",
         )
         self.assertEqual(profile.webid, webid)
         self.assertEqual(profile.name, "Alice Kim")
         self.assertEqual(
             profile.storages,
-            ("https://pod.wolin.cloud/pods/alice/", "https://alice.wolin.cloud/"),
+            ("https://pod.wolin.id/pods/alice/", "https://alice.wolin.id/"),
         )
-        self.assertEqual(profile.primary_storage, "https://pod.wolin.cloud/pods/alice/")
-        self.assertEqual(profile.primary_inbox, "https://pod.wolin.cloud/pods/alice/inbox/")
-        self.assertEqual(profile.primary_oidc_issuer, "https://id.wolin.id")
+        self.assertEqual(profile.primary_storage, "https://pod.wolin.id/pods/alice/")
+        self.assertEqual(profile.primary_inbox, "https://pod.wolin.id/pods/alice/inbox/")
+        self.assertEqual(profile.primary_oidc_issuer, "https://auth.wolin.id")
 
-        profile.verify_oidc_issuer("https://id.wolin.id")
+        profile.verify_oidc_issuer("https://auth.wolin.id")
         with self.assertRaises(DpopValidationError):
             profile.verify_oidc_issuer("https://evil.example")
 
     def test_sparql_directives_collections_and_literals(self) -> None:
         turtle = '''
-        BASE <https://alice.wolin.cloud/profile/>
+        BASE <https://alice.wolin.id/profile/>
         PREFIX : <#>
         PREFIX solid: <http://www.w3.org/ns/solid/terms#>
         PREFIX pim: <http://www.w3.org/ns/pim/space#>
@@ -218,10 +260,10 @@ Wolin""" ;
         '''
         profile = parse_webid_turtle(
             turtle,
-            "https://alice.wolin.cloud/profile/card#me",
+            "https://alice.wolin.id/profile/card#me",
         )
         self.assertEqual(profile.name, "Alice\nWolin")
-        self.assertEqual(profile.primary_storage, "https://alice.wolin.cloud/")
+        self.assertEqual(profile.primary_storage, "https://alice.wolin.id/")
         self.assertEqual(profile.primary_oidc_issuer, "https://login.inrupt.com")
 
         triples = parse_turtle_triples(turtle)
@@ -236,12 +278,14 @@ Wolin""" ;
 
 
 class _MockSolidPodServer:
-    """In-memory Solid LDP + RFC 9449 DPoP verification server for httpx.MockTransport."""
+    """In-memory Solid LDP + RFC 9449 DPoP + Signed Asset Offload server for httpx.MockTransport."""
 
     def __init__(self, expected_token: str, *, require_nonce: str | None = None) -> None:
         self.expected_token = expected_token
         self.require_nonce = require_nonce
         self.seen_jtis: set[str] = set()
+        self.cdn_requests: list[httpx.Request] = []
+        self.offloaded_blob = b"\x89PNG\r\n\x1a\nwolin-signed-r2-asset-payload"
         self.resources: dict[str, tuple[bytes, str]] = {
             "/pods/alice/profile/card": (
                 (
@@ -253,15 +297,32 @@ class _MockSolidPodServer:
                     b'  foaf:name "Alice" ;\n'
                     b"  pim:storage </pods/alice/> ;\n"
                     b"  ldp:inbox </pods/alice/inbox/> ;\n"
-                    b"  solid:oidcIssuer <https://id.wolin.id> .\n"
+                    b"  solid:oidcIssuer <https://auth.wolin.id> .\n"
                 ),
                 "text/turtle",
             )
         }
 
     def handle(self, request: httpx.Request) -> httpx.Response:
+        host = request.url.host
         path = request.url.path
         full_url = str(request.url)
+
+        # Simulated external Edge/R2 signed asset host: MUST NOT receive Authorization or DPoP!
+        if host in ("auth.wolin.id", "cdn.r2.example"):
+            self.cdn_requests.append(request)
+            if "authorization" in request.headers or "dpop" in request.headers:
+                return httpx.Response(
+                    400,
+                    text="Credential leak detected on external signed asset URL",
+                )
+            if path == "/assets/alice/media/clip.png" and request.url.params.get("sig") == "ok":
+                return httpx.Response(
+                    200,
+                    content=self.offloaded_blob,
+                    headers={"Content-Type": "image/png"},
+                )
+            return httpx.Response(403, text="Invalid asset signature")
 
         # Public WebID card endpoint (no auth required)
         if path == "/pods/alice/profile/card" and request.method == "GET":
@@ -309,24 +370,41 @@ class _MockSolidPodServer:
                 },
             )
 
-        # Pod provisioning endpoint
-        if path == "/pods" and request.method == "POST":
+        # Signed asset offload endpoint (302 Found -> external signed Edge/R2 URL)
+        if path == "/pods/alice/media/clip.png" and request.method == "GET":
+            return httpx.Response(
+                302,
+                headers={
+                    "Location": "https://auth.wolin.id/assets/alice/media/clip.png?exp=1763500060&sig=ok",
+                    "ETag": _etag_for(self.offloaded_blob),
+                    "WAC-Allow": 'user="read write control",public=""',
+                    "Link": (
+                        f'<{LDP_RESOURCE_IRI}>; rel="type", '
+                        f'<{LDP_NON_RDF_SOURCE_IRI}>; rel="type", '
+                        f'<clip.png.acl>; rel="acl"'
+                    ),
+                    "Cache-Control": "private, no-store",
+                },
+            )
+
+        # Pod provisioning endpoint (`POST /api/pods`)
+        if path == "/api/pods" and request.method == "POST":
             req_json: dict[str, Any] = json.loads(request.content.decode("utf-8"))
             pod_id = req_json["pod_id"]
             return httpx.Response(
                 201,
                 json={
                     "pod_id": pod_id,
-                    "pod_url": f"https://pod.wolin.cloud/pods/{pod_id}/",
-                    "subdomain_url": f"https://{pod_id}.wolin.cloud/",
-                    "webid": f"https://pod.wolin.cloud/pods/{pod_id}/profile/card#me",
+                    "pod_url": f"https://pod.wolin.id/pods/{pod_id}/",
+                    "subdomain_url": f"https://{pod_id}.wolin.id/",
+                    "webid": f"https://pod.wolin.id/pods/{pod_id}/profile/card#me",
                     "owner_webid": req_json.get(
                         "owner_webid",
-                        f"https://pod.wolin.cloud/pods/{pod_id}/profile/card#me",
+                        f"https://pod.wolin.id/pods/{pod_id}/profile/card#me",
                     ),
                     "display_name": req_json.get("display_name", pod_id),
-                    "storage": f"https://pod.wolin.cloud/pods/{pod_id}/",
-                    "inbox": f"https://pod.wolin.cloud/pods/{pod_id}/inbox/",
+                    "storage": f"https://pod.wolin.id/pods/{pod_id}/",
+                    "inbox": f"https://pod.wolin.id/pods/{pod_id}/inbox/",
                     "seeded_resources": [
                         f"/pods/{pod_id}/",
                         f"/pods/{pod_id}/profile/card",
@@ -412,18 +490,18 @@ class TestWolinClientAsync(unittest.IsolatedAsyncioTestCase):
 
         async with httpx.AsyncClient(transport=transport) as http_client:
             async with WolinClient(
-                base_url="https://pod.wolin.cloud",
+                base_url=DEFAULT_POD_URL,
                 access_token=token,
                 dpop_signer=signer,
                 http_client=http_client,
             ) as client:
                 # 1. Dereference WebID & discover pim:storage
-                webid = "https://pod.wolin.cloud/pods/alice/profile/card#me"
+                webid = "https://pod.wolin.id/pods/alice/profile/card#me"
                 profile = await client.fetch_webid_profile(webid)
                 self.assertEqual(profile.name, "Alice")
-                profile.verify_oidc_issuer("https://id.wolin.id")
+                profile.verify_oidc_issuer(DEFAULT_AUTH_URL)
                 storage_root = await client.discover_storage(webid)
-                self.assertEqual(storage_root, "https://pod.wolin.cloud/pods/alice/")
+                self.assertEqual(storage_root, "https://pod.wolin.id/pods/alice/")
 
                 # 2. Create RDF resource with If-None-Match: *
                 note_url = f"{storage_root}private/note.ttl"
@@ -445,7 +523,7 @@ class TestWolinClientAsync(unittest.IsolatedAsyncioTestCase):
                 self.assertIn(LDP_RDF_SOURCE_IRI, fetched.link_types)
                 self.assertEqual(
                     fetched.acl_url,
-                    "https://pod.wolin.cloud/pods/alice/private/note.ttl.acl",
+                    "https://pod.wolin.id/pods/alice/private/note.ttl.acl",
                 )
                 self.assertIsNotNone(fetched.wac_allow)
 
@@ -487,6 +565,34 @@ class TestWolinClientAsync(unittest.IsolatedAsyncioTestCase):
                 with self.assertRaises(WolinNotFoundError):
                     await client.get(note_url)
 
+    async def test_signed_asset_302_redirect_strips_auth_and_dpop_headers(self) -> None:
+        token = "solid-oidc-asset-token"
+        pod_server = _MockSolidPodServer(expected_token=token)
+        transport = httpx.MockTransport(pod_server.handle)
+
+        # Even if caller passes follow_redirects=True on AsyncClient, WolinClient must never leak!
+        async with httpx.AsyncClient(transport=transport, follow_redirects=True) as http_client:
+            async with WolinClient(
+                base_url=DEFAULT_POD_URL,
+                access_token=token,
+                http_client=http_client,
+            ) as client:
+                asset = await client.get("/pods/alice/media/clip.png")
+                self.assertEqual(asset.status_code, 200)
+                self.assertEqual(asset.content, pod_server.offloaded_blob)
+                self.assertEqual(asset.content_type, "image/png")
+                self.assertEqual(asset.etag, _etag_for(pod_server.offloaded_blob))
+                self.assertIn(LDP_NON_RDF_SOURCE_IRI, asset.link_types)
+                self.assertEqual(
+                    asset.acl_url,
+                    "https://pod.wolin.id/pods/alice/media/clip.png.acl",
+                )
+
+                self.assertEqual(len(pod_server.cdn_requests), 1)
+                cdn_req = pod_server.cdn_requests[0]
+                self.assertNotIn("authorization", cdn_req.headers)
+                self.assertNotIn("dpop", cdn_req.headers)
+
     async def test_dpop_nonce_challenge_retry_and_pod_provisioning(self) -> None:
         token = "provision-admin-token"
         pod_server = _MockSolidPodServer(
@@ -497,13 +603,18 @@ class TestWolinClientAsync(unittest.IsolatedAsyncioTestCase):
 
         async with httpx.AsyncClient(transport=transport) as http_client:
             async with WolinClient(
-                base_url="https://pod.wolin.cloud",
+                base_url=DEFAULT_POD_URL,
                 access_token=token,
                 http_client=http_client,
             ) as client:
+                with self.assertRaises(InvalidPodIdError):
+                    await client.provision_pod("alice--bad")
+                with self.assertRaises(InvalidPodIdError):
+                    await client.provision_pod("auth")
+
                 pod = await client.provision_pod("bob", display_name="Bob Sovereign")
                 self.assertEqual(pod.pod_id, "bob")
-                self.assertEqual(pod.subdomain_url, "https://bob.wolin.cloud/")
+                self.assertEqual(pod.subdomain_url, "https://bob.wolin.id/")
                 self.assertEqual(len(pod_server.seen_jtis), 2)
 
                 # Second request reuses cached DPoP-Nonce on first attempt (only 1 new jti)
@@ -516,7 +627,7 @@ class TestWolinClientAsync(unittest.IsolatedAsyncioTestCase):
 
         async with httpx.AsyncClient(transport=transport) as http_client:
             async with WolinClient(
-                base_url="https://pod.wolin.cloud",
+                base_url=DEFAULT_POD_URL,
                 access_token="wrong-secret",
                 http_client=http_client,
             ) as client:

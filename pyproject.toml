@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "wolin-id"
 version = "0.1.0"
-description = "Official async Python SDK for Wolin Solid Pod Engine (Solid-OIDC, RFC 9449 DPoP, WebID & LDP)"
+description = "Official async Python SDK for Wolin (月印千江) Solid Pod Engine (Solid-OIDC, RFC 9449 DPoP, WebID & LDP)"
 readme = "README.md"
 requires-python = ">=3.11"
 license = "MIT OR Apache-2.0"
